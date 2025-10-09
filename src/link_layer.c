@@ -1,10 +1,15 @@
 // Link layer protocol implementation
 
+// MISC
+#define _POSIX_SOURCE 1 // POSIX compliant source
+
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
 #include "link_layer.h"
 #include "serial_port.h"
 
-// MISC
-#define _POSIX_SOURCE 1 // POSIX compliant source
 
 #define FALSE 0
 #define TRUE 1
@@ -19,6 +24,20 @@
 #define C_Set 0x03
 #define C_UA 0x07
 
+typedef enum {
+    ST_START = 0,
+    ST_FLAG_RCV,
+    ST_A_RCV,
+    ST_C_RCV,
+    ST_BCC_OK,
+} RxState;
+
+static volatile sig_atomic_t g_timed_out = 0;
+
+static void alarm_handler(int sig);
+static int send_set(void);
+static int send_ua(void);
+static int stateMachineEstablishment(unsigned char Aexp, unsigned char Cexp, int timeout_s);
 ////////////////////////////////////////////////
 // LLOPEN
 ////////////////////////////////////////////////
@@ -27,29 +46,38 @@ int llopen(LinkLayer connectionParameters)
     if (openSerialPort(connectionParameters.serialPort, BAUDRATE) < 0)
     {
         perror("openSerialPort");
-        exit(-1);
+        return -1;
     }
     printf("Serial port %s opened\n", connectionParameters.serialPort);
-    int wrote;
-    int read;
-    if (connectionParameters.role == LlTx)
-    {
-        wrote = writeEstablishment(connectionParameters);
-        read = readEstablishment(connectionParameters);
-    }
-    else
-    {
-        read = readEstablishment(connectionParameters);
-        wrote = writeEstablishment(connectionParameters);
-    }
+    if (connectionParameters.role == LlTx) {
+        for (int attempt = 1; attempt <= connectionParameters.nRetransmissions; ++attempt) {
+            if (send_set() < 0) { perror("[TX] SET not sent"); return -1; }
+            printf("[TX] SET sent (try %d/%d), waiting UA (%ds)\n",
+                   attempt, connectionParameters.nRetransmissions, connectionParameters.timeout);
 
-    if (wrote != 1 || read != 1)
-    {
-        perror("Communication start error");
-        exit(-1);
-    }
+            int received = stateMachineEstablishment(A_3, C_UA, connectionParameters.timeout);
+            if (received == 1) { printf("[TX] UA recieved\n"); return 0; }
+            if (received == -1) { perror("[TX] reading UA"); return -1; }
+            printf("[TX] Timeout waiting UA\n");
+        }
+        fprintf(stderr, "[TX] Fail: exceeded retransmissions.\n");
+        return -1;
 
-    return 1;
+    } else {
+        printf("[RX] waiting SET (%ds)...\n", connectionParameters.timeout);
+        int received = stateMachineEstablishment(A_1, C_Set, connectionParameters.timeout);
+        if (received == 1) {
+            printf("[RX] SET received. Sending UA\n");
+            if (send_ua() < 0) { perror("[RX] UA not sent"); return -1; }
+            return 0;
+        } else if (received == 0) {
+            fprintf(stderr, "[RX] Timeout waiting SET\n");
+            return -1;
+        } else {
+            perror("[RX] reading SET");
+            return -1;
+        }
+    }
 }
 
 ////////////////////////////////////////////////
@@ -79,120 +107,68 @@ int llclose()
     return 0;
 }
 
-int writeEstablishment(LinkLayer connectionParameters)
+static int send_set(void) {
+    unsigned char SET[BUF_SIZE] = { FLAG, A_1, C_Set, (unsigned char)(A_1 ^ C_Set), FLAG };
+    int n = writeBytesSerialPort(SET, 5);
+    return (n == 5) ? 0 : -1;
+}
+
+static int send_ua(void) {
+    unsigned char UA[BUF_SIZE] = { FLAG, A_3, C_UA, (unsigned char)(A_3 ^ C_UA), FLAG };
+    int n = writeBytesSerialPort(UA, 5);
+    return (n == 5) ? 0 : -1;
+}
+
+static int stateMachineEstablishment(unsigned char A, unsigned char C, int timeout_s)
 {
-    if (connectionParameters.role == LlTx)
-    {
-        unsigned char SET[BUF_SIZE];
+    RxState st = ST_START;
+    g_timed_out = 0;
+    signal(SIGALRM, alarm_handler);
+    alarm(timeout_s);
 
-        SET[0] = FLAG;
+    while (TRUE) {
+        if (g_timed_out) { alarm(0); return 0; }
 
-        SET[1] = A_1;
+        unsigned char b = 0;
+        int received = readByteSerialPort(&b);
+        if (received < 0) { alarm(0); return -1; }
+        if (received == 0) {
+            continue;                           
+        }
 
-        SET[2] = C_Set;
+        switch (st) {
+            case ST_START:
+                if (b == FLAG) st = ST_FLAG_RCV;
+                break;
 
-        SET[3] = A_1 ^ C_Set;
+            case ST_FLAG_RCV:
+                if (b == FLAG) {}
+                else if (b == A) st = ST_A_RCV;
+                else st = ST_START;
+                break;
 
-        SET[4] = FLAG;
+            case ST_A_RCV:
+                if (b == FLAG) st = ST_FLAG_RCV;
+                else if (b == C) st = ST_C_RCV;
+                else st = ST_START;
+                break;
 
-        int bytes = writeBytesSerialPort(SET, 5);
-        return (bytes == 5) ? 1 : -1;
-    }
-    else
-    {
-        unsigned char UA[BUF_SIZE];
+            case ST_C_RCV: {
+                unsigned char bcc_ok = (unsigned char)(A ^ C);
+                if (b == FLAG) st = ST_FLAG_RCV;
+                else if (b == bcc_ok) st = ST_BCC_OK;
+                else st = ST_START;
+            } break;
 
-        UA[0] = FLAG;
-        UA[1] = A_3;
-        UA[2] = C_UA;
-        UA[3] = A_3 ^ C_UA;
-        UA[4] = FLAG;
-
-        int bytes = writeBytesSerialPort(UA, 5);
-        return (bytes == 5) ? 1 : -1;
+            case ST_BCC_OK:
+                if (b == FLAG) { alarm(0); return 1; }
+                else st = ST_START;
+                break;
+        }
     }
 }
 
-int readEstablishment(LinkLayer connectionParameters)
-{
-    int STOP = FALSE;
-    int nBytesBuf = 0;
-    volatile int byte_counter = 0;
-    if (connectionParameters.role == LlTx)
-    {
-        while (STOP == FALSE)
-        {
-            unsigned char byte;
-            int bytes = readByteSerialPort(&byte);
-            nBytesBuf += bytes;
-            byte_counter++;
-
-            printf("byte = 0x%02X\n", byte);
-            if (!validateByteUA(byte, byte_counter))
-                exit(-1);
-            if (byte_counter == 5)
-                STOP = TRUE;
-        }
-        if (STOP == TRUE)
-        {
-            printf("UA bytes received: %d\n", nBytesBuf);
-            return 1;
-        }
-    }
-    else
-        while (STOP == FALSE)
-        {
-            unsigned char byte;
-            int bytes = readByteSerialPort(&byte);
-            nBytesBuf += bytes;
-            byte_counter++;
-
-            printf("byte = 0x%02X\n", byte);
-            if (validateByteSET(byte, byte_counter) == 0)
-                exit(-1);
-            if (byte_counter == 5)
-                STOP = TRUE;
-        }
-    if (STOP == TRUE)
-    {
-        printf("UA bytes received: %d\n", nBytesBuf);
-    }
-}
-
-int validateByteUA(unsigned char byte, int idx)
-{
-    switch (idx)
-    {
-    case 1:
-        return (byte == FLAG);
-    case 2:
-        return (byte == A_3);
-    case 3:
-        return (byte == C_UA);
-    case 4:
-        return (byte == (unsigned char)(A_3 ^ C_UA));
-    case 5:
-        return (byte == FLAG);
-    default:
-        return 0;
-    }
-}
-
-int validateByteSET(unsigned char byte, int idx)
-{
-    switch (idx)
-    {
-    case 1:
-        return (byte == FLAG);
-    case 2:
-        return (byte == A_1);
-    case 3:
-        return (byte == C_Set);
-    case 4:
-        return (byte == (unsigned char)(A_1 ^ C_Set));
-    case 5:
-        return (byte == FLAG);
-    default:
-        return 0;
-    }
+static void alarm_handler(int sig) {
+    (void)sig;
+    g_timed_out = 1;
 }

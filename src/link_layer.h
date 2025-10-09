@@ -19,14 +19,6 @@ typedef struct
     int timeout;
 } LinkLayer;
 
-typedef enum {
-    ST_START = 0,
-    ST_FLAG_RCV,
-    ST_A_RCV,
-    ST_C_RCV,
-    ST_BCC_OK,
-    ST_END
-} RxState;
 
 // Size of maximum acceptable payload.
 // Maximum number of bytes that application layer should send to link layer.
@@ -51,8 +43,5 @@ int llread(unsigned char *packet);
 // Close previously opened connection and print transmission statistics in the console.
 // Return 0 on success or -1 on error.
 int llclose();
-static int writeEstablishment(LinkLayer connectionParameters);
-static int readEstablishment(LinkLayer connectionParameters);
-static int validateByteUA(unsigned char byte, int idx);
-static int validateByteSET(unsigned char byte, int idx);
+
 #endif // _LINK_LAYER_H_
