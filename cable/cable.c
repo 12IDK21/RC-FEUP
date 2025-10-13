@@ -4,6 +4,7 @@
 // Author: Manuel Ricardo [mricardo@fe.up.pt]
 // Modified by: Eduardo Nuno Almeida [enalmeida@fe.up.pt]
 // Modified by: Rui Prior [rcprior@fc.up.pt]
+// Portability fixes and macOS compatibility added.
 
 #include <fcntl.h>
 #include <math.h>
@@ -11,16 +12,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>    // for bzero if needed (we use memset)
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/resource.h>
 
-#define TXDEV "/dev/ttyS10"
-#define RXDEV "/dev/ttyS11"
-#define TX_EMULATOR "/dev/emulatorTx"
-#define RX_EMULATOR "/dev/emulatorRx"
+#define TXDEV "/tmp/ttyS10"
+#define RXDEV "/tmp/ttyS11"
+#define TX_EMULATOR "/tmp/emulatorTx"
+#define RX_EMULATOR "/tmp/emulatorRx"
 
 // Baudrate settings are defined in <asm/termbits.h>, which is
 // included by <termios.h>
@@ -57,6 +62,7 @@ struct Parameters par = {
     .rx2tx = NULL,
     .rx2txValid = NULL,
     .logfile = NULL};
+
 
 // Returns: serial port file descriptor (fd).
 int openSerialPort(const char *serialPort, struct termios *oldtio, struct termios *newtio)
@@ -97,25 +103,48 @@ void addNoiseToBuffer(unsigned char *buf, size_t errorIndex)
 // Returns 0 on success, -1 on failure
 int init_ring_buffers(void)
 {
-    long nsecPropDelay = 1000 * par.propDelay;
-    long bytesInFlight = nsecPropDelay / par.byteDelay.tv_nsec;
+    // Protect against zero byteDelay
+    if (par.byteDelay.tv_nsec == 0 && par.byteDelay.tv_sec == 0) {
+        // nothing to do, set minimal buffer
+        par.bufSize = 1;
+        par.tx2rx = realloc(par.tx2rx, (size_t)par.bufSize);
+        par.tx2rxValid = realloc(par.tx2rxValid, (size_t)par.bufSize);
+        par.rx2tx = realloc(par.rx2tx, (size_t)par.bufSize);
+        par.rx2txValid = realloc(par.rx2txValid, (size_t)par.bufSize);
+        if (par.tx2rx == NULL || par.tx2rxValid == NULL || par.rx2tx == NULL || par.rx2txValid == NULL)
+            return -1;
+        memset(par.tx2rxValid, 0, (size_t)par.bufSize);
+        memset(par.rx2txValid, 0, (size_t)par.bufSize);
+        par.tx2rxIdx = 0;
+        par.rx2txIdx = 0;
+        return 0;
+    }
+
+    long nsecPropDelay = 1000L * (long)par.propDelay; // desired prop in nsec
+    long byteDelayNsec = par.byteDelay.tv_nsec + par.byteDelay.tv_sec * 1000000000L;
+    if (byteDelayNsec <= 0) byteDelayNsec = 1; // avoid division by zero
+
+    long bytesInFlight = nsecPropDelay / byteDelayNsec;
     // Round instead of truncating
-    if (nsecPropDelay % par.byteDelay.tv_nsec > par.byteDelay.tv_nsec / 2)
+    if (nsecPropDelay % byteDelayNsec > byteDelayNsec / 2)
     {
         ++bytesInFlight;
     }
-    long actualPropDelay = bytesInFlight * par.byteDelay.tv_nsec / 1000; // usec
-    par.bufSize = bytesInFlight + 1;
-    par.tx2rx = realloc(par.tx2rx, par.bufSize);
-    par.tx2rxValid = realloc(par.tx2rxValid, par.bufSize);
-    par.rx2tx = realloc(par.rx2tx, par.bufSize);
-    par.rx2txValid = realloc(par.rx2txValid, par.bufSize);
+    long actualPropDelay = bytesInFlight * byteDelayNsec / 1000L; // usec
+    par.bufSize = (int)(bytesInFlight + 1);
+    if (par.bufSize < 1) par.bufSize = 1;
+
+    // allocate bytes (use sizeof(char)==1)
+    par.tx2rx = realloc(par.tx2rx, (size_t)par.bufSize * sizeof(char));
+    par.tx2rxValid = realloc(par.tx2rxValid, (size_t)par.bufSize * sizeof(char));
+    par.rx2tx = realloc(par.rx2tx, (size_t)par.bufSize * sizeof(char));
+    par.rx2txValid = realloc(par.rx2txValid, (size_t)par.bufSize * sizeof(char));
     if (par.tx2rx == NULL || par.tx2rxValid == NULL || par.rx2tx == NULL || par.rx2txValid == NULL)
     {
         return -1;
     }
-    bzero(par.tx2rxValid, par.bufSize);
-    bzero(par.rx2txValid, par.bufSize);
+    memset(par.tx2rxValid, 0, (size_t)par.bufSize);
+    memset(par.rx2txValid, 0, (size_t)par.bufSize);
     par.tx2rxIdx = 0;
     par.rx2txIdx = 0;
     printf("PROPAGATION DELAY SET TO %ld usec (DESIRED = %lu usec)\n", actualPropDelay, par.propDelay);
@@ -127,7 +156,7 @@ int init_ring_buffers(void)
 void set_baud_rate(unsigned long baud)
 {
     // 10 bit times per byte; delay in nanoseconds
-    double delay = 1.0e10 / baud;
+    double delay = 1.0e10 / (double)baud;
     par.byteDelay.tv_sec = 0;
     par.byteDelay.tv_nsec = (long) delay;
     printf("BAUD RATE: %lu\n", baud);
@@ -137,10 +166,40 @@ void set_baud_rate(unsigned long baud)
 
 // Make the program use RT priority to improve precision in timing
 void set_rt_priority(void) {
+#ifdef __linux__
     struct sched_param sp = { .sched_priority = 50 };
     if (sched_setscheduler(0, SCHED_FIFO, &sp) == -1) {
-      perror("Could not set realtime priority");
+      perror("Could not set realtime priority (Linux sched_setscheduler)");
     }
+#elif defined(__APPLE__)
+    // macOS does not expose SCHED_FIFO to unprivileged user processes.
+    // Try pthread_setschedparam as best-effort; if it fails fall back to setpriority.
+    pthread_t self = pthread_self();
+    struct sched_param sp;
+    sp.sched_priority = 63; // macOS visible range typically 0..63
+    int ret = pthread_setschedparam(self, SCHED_FIFO, &sp);
+    if (ret != 0) {
+        // Try SCHED_OTHER with higher priority or fallback to nice
+        struct sched_param sp2;
+        sp2.sched_priority = 31;
+        ret = pthread_setschedparam(self, SCHED_OTHER, &sp2);
+        if (ret != 0) {
+            // Last resort: try to reduce niceness (may require privileges)
+            if (setpriority(PRIO_PROCESS, 0, -10) == -1) {
+                fprintf(stderr, "Could not set realtime-like priority on macOS: %s\n", strerror(errno));
+            } else {
+                printf("Reduced niceness to try to improve scheduling precision (macOS).\n");
+            }
+        } else {
+            printf("Set pthread scheduling policy SCHED_OTHER with priority (macOS)\n");
+        }
+    } else {
+        printf("Set pthread scheduling policy SCHED_FIFO (macOS) - best-effort\n");
+    }
+#else
+    // Unknown OS: no-op
+    (void)0;
+#endif
 }
 
 
@@ -312,6 +371,8 @@ int main(int argc, char *argv[])
     int unreliableRate = FALSE;
     clock_gettime(CLOCK_MONOTONIC, &nextTxTime);
 
+    srand((unsigned) time(NULL));
+
     while (STOP == FALSE)
     {
         // Check how much waiting time we should have (if any)
@@ -384,7 +445,7 @@ int main(int argc, char *argv[])
                 if (par.byteER != 0.0 && (double) rand() / (double) RAND_MAX < par.byteER)
                 {
                     // At most one wrong bit per byte, good enough if ber < 0.02
-                    par.tx2rx[par.tx2rxIdx] ^= (char) 1 << rand() % 8;
+                    par.tx2rx[par.tx2rxIdx] ^= (char) (1 << (rand() % 8));
                 }
                 write(fdRx, par.tx2rx + par.tx2rxIdx, 1);
             }
@@ -395,7 +456,7 @@ int main(int argc, char *argv[])
                 if (par.byteER != 0.0 && (double) rand() / (double) RAND_MAX < par.byteER)
                 {
                     // At most one wrong bit per byte, good enough if ber < 0.02
-                    par.rx2tx[par.rx2txIdx] ^= (char) 1 << rand() % 8;
+                    par.rx2tx[par.rx2txIdx] ^= (char) (1 << (rand() % 8));
                 }
                 write(fdTx, par.rx2tx + par.rx2txIdx, 1);
             }
