@@ -129,9 +129,13 @@ static int send_frame(const unsigned char *buf, int bufSize) {
 
 static int receive_frame(void) {
     unsigned char byte;
-    int n = readByteSerialPort(&byte);
-    printf("byte : %c)...\n", byte);
-    return n;
+    for (size_t i = 0; i < 50; i++)
+    {
+        int n = readByteSerialPort(&byte);
+        printf("byte : %c,%d\n", byte,n);
+    }
+    
+    return 1;
 }
 
 static int stateMachineEstablishment(unsigned char A, unsigned char C, int timeout_s)
