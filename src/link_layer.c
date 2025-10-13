@@ -37,7 +37,7 @@ static volatile sig_atomic_t g_timed_out = 0;
 static void alarm_handler(int sig);
 static int send_set(void);
 static int send_ua(void);
-static int stateMachineEstablishment(unsigned char Aexp, unsigned char Cexp, int timeout_s);
+static int stateMachineEstablishment(unsigned char Aexintp, unsigned char Cexp, int timeout_s);
 ////////////////////////////////////////////////
 // LLOPEN
 ////////////////////////////////////////////////
@@ -57,7 +57,6 @@ int llopen(LinkLayer connectionParameters)
 
             int received = stateMachineEstablishment(A_3, C_UA, connectionParameters.timeout);
             if (received == 1) { printf("[TX] UA recieved\n"); return 0; }
-            if (received == -1) { perror("[TX] reading UA"); return -1; }
             printf("[TX] Timeout waiting UA\n");
         }
         fprintf(stderr, "[TX] Fail: exceeded retransmissions.\n");
@@ -85,15 +84,16 @@ int llopen(LinkLayer connectionParameters)
 ////////////////////////////////////////////////
 int llwrite(const unsigned char *buf, int bufSize)
 {
+    send_frame(buf,bufSize);
+    return 0;
 }
 
 ////////////////////////////////////////////////
 // LLREAD
 ////////////////////////////////////////////////
 int llread(unsigned char *packet)
-{
-    // TODO: Implement this function
-
+{   
+    fprintf("%d",receive_frame());
     return 0;
 }
 
@@ -117,6 +117,18 @@ static int send_ua(void) {
     unsigned char UA[BUF_SIZE] = { FLAG, A_3, C_UA, (unsigned char)(A_3 ^ C_UA), FLAG };
     int n = writeBytesSerialPort(UA, 5);
     return (n == 5) ? 0 : -1;
+}
+
+static int send_frame(const unsigned char *buf, int bufSize) {
+    int n = writeBytesSerialPort(buf, bufSize);
+    return (n == bufSize) ? 0 : -1;
+}
+
+static int receive_frame() {
+    unsigned char byte;
+    int n = readByteSerialPort(byte);
+    printf("byte : %ds)...\n", byte);
+    return n;
 }
 
 static int stateMachineEstablishment(unsigned char A, unsigned char C, int timeout_s)
