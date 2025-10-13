@@ -37,6 +37,8 @@ static volatile sig_atomic_t g_timed_out = 0;
 static void alarm_handler(int sig);
 static int send_set(void);
 static int send_ua(void);
+static int send_frame(const unsigned char *buf, int bufSize);
+static int receive_frame(void);
 static int stateMachineEstablishment(unsigned char Aexintp, unsigned char Cexp, int timeout_s);
 ////////////////////////////////////////////////
 // LLOPEN
@@ -93,7 +95,8 @@ int llwrite(const unsigned char *buf, int bufSize)
 ////////////////////////////////////////////////
 int llread(unsigned char *packet)
 {   
-    fprintf("%d",receive_frame());
+    int n = receive_frame();
+    printf("%d\n",n);
     return 0;
 }
 
@@ -124,10 +127,10 @@ static int send_frame(const unsigned char *buf, int bufSize) {
     return (n == bufSize) ? 0 : -1;
 }
 
-static int receive_frame() {
+static int receive_frame(void) {
     unsigned char byte;
-    int n = readByteSerialPort(byte);
-    printf("byte : %ds)...\n", byte);
+    int n = readByteSerialPort(&byte);
+    printf("byte : %c)...\n", byte);
     return n;
 }
 
